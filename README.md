@@ -71,12 +71,15 @@ Run scan again to check the result.
 
     ./ios-workers.sh start
 
-This starts one background worker that serves every iOS repo it found. Each repo is passed with its own --worker-dir. If the worker is already running, it doesn't start a second one.
+This starts one background supervisor that serves every iOS repo it found. Each repo is passed with its own --worker-dir. If the supervisor is already running, it doesn't start a second one.
 
-Each worker runs inside a small restart loop. The loop restarts the worker after it exits, so the worker stays available:
+The supervisor keeps the worker available and keeps the list of repos up to date:
 
 - After an idle release. The CLI's help says a worker exits on its own after an hour with no work, so a supervisor can restart it. The script passes that hour as --idle-release-timeout 3600. Change it with IOS_WORKERS_IDLE_TIMEOUT.
 - After a crash. The loop waits a few seconds, then tries again. If the worker keeps failing within a minute, the wait doubles each time, up to 5 minutes. After 20 fast failures in a row, the loop gives up and writes that in the log.
+- When you add or remove an iOS repo. By default the supervisor re-scans every 5 minutes. If the set of repos changed, it restarts the worker with the updated --worker-dir list. Change the interval with IOS_WORKERS_WATCH_INTERVAL, or set it to 0 to turn periodic watching off. Even with watching off, each restart after idle or crash still re-scans first.
+
+If no iOS repos exist yet, and watching is on, the supervisor still starts and waits for one to appear. You don't need to re-run start or reload the LaunchAgent after cloning a new repo.
 
 The log is ~/Library/Logs/ios-workers/all-repos.log. The process ID goes to ~/.config/ios-workers/pids.
 
@@ -103,6 +106,7 @@ All settings are optional environment variables.
 - IOS_WORKERS_CLI: the full path to the Cursor CLI, if the script can't find it.
 - IOS_WORKERS_IDLE_TIMEOUT: seconds a worker may sit idle before it exits and is restarted. The default is 3600.
 - IOS_WORKERS_LOOP: "1" is the default and uses the restart loop. "0" runs each worker once, with no restart.
+- IOS_WORKERS_WATCH_INTERVAL: seconds between re-scans for new or removed iOS repos while workers are running. The default is 300 (5 minutes). Set to 0 to turn periodic watching off. With the restart loop on, single mode still re-scans before each worker restart.
 - IOS_WORKERS_RESTART_DELAY: seconds to wait before a normal restart. The default is 5.
 - IOS_WORKERS_LABEL: the LaunchAgent label for install and uninstall. The default is io.github.cursor-ios-workers.
 
@@ -118,8 +122,9 @@ This adds a LaunchAgent for your user at ~/Library/LaunchAgents/io.github.cursor
 
 - It doesn't use sudo. It loads with "launchctl bootstrap gui/" followed by your user ID.
 - It refuses to install if the Cursor CLI is missing or you are not signed in.
-- It saves the settings you have set at install time, such as IOS_WORKERS_NAME, and the path to the CLI.
+- It saves the settings you have set at install time, such as IOS_WORKERS_NAME and IOS_WORKERS_WATCH_INTERVAL, and the path to the CLI.
 - It points at the script where it is now. If you move the script, run install again.
+- After login, start launches the supervisor once. That supervisor keeps running and watches for new iOS repos, so you don't need to re-run install or start when you clone another repo.
 
 To remove it:
 
@@ -164,6 +169,7 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 - Per-repo mode is experimental. It gives each worker its own --data-dir to avoid that lock. It is not confirmed that this works, or that several workers may share one machine name.
 - Labels: "worker debug" shows that the default display name is the hostname. The script sets its own name with --name. In single mode, the first --worker-dir sets the worker's repo=owner/name label. The other repos are still served, because each gets its own --worker-dir.
 - Restarts: the restart loop keeps workers running while you are logged in. Workers stop when you log out or restart your Mac. Use install to start them again at each login, or run start yourself.
+- New repos: the default watch interval is 5 minutes. Until the next scan (or the next idle/crash restart), a brand-new checkout is not served yet.
 - Idle timeout: Cursor's docs say --idle-release-timeout defaults to 0, which means no idle release. The real CLI's help says 3600. The script always passes a value, so either way works.
 - The cursor-agent name and the Homebrew location are not in Cursor's docs. They come from a real installation.
 - Worktrees and submodules are skipped.
@@ -190,7 +196,8 @@ Agents work in the checkouts already on your Mac. They don't clone or switch bra
 
 ## Troubleshooting
 
-- Read the log for the repo in ~/Library/Logs/ios-workers. Each restart is written there with the exit code and the wait time.
+- Read the log for the repo in ~/Library/Logs/ios-workers. Each restart is written there with the exit code and the wait time. A line saying "Repo set changed" means the supervisor restarted the worker after it found a new or removed repo.
+- If you updated the script and new repos are still ignored, the old supervisor may still be running. Run stop, then start (or install again) so the new watcher replaces it.
 - If you used install, also read ~/Library/Logs/ios-workers/launchd.log.
 - Run "agent worker debug", or "cursor-agent worker debug". It checks sign-in, routing and whether Cursor can see your worker.
 - Make sure the Cursor app and the CLI use the same account.
