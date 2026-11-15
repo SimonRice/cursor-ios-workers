@@ -8,6 +8,9 @@
 # Usage:
 #   ios-workers.sh scan     Dry run. Lists iOS repos that would get a worker. Changes nothing.
 #   ios-workers.sh start    Starts one background worker that serves every iOS repo.
+#                           With the default restart loop, also watches for newly added
+#                           (or removed) iOS repos and updates the worker without a
+#                           manual restart — important when start is run from a LaunchAgent.
 #   ios-workers.sh stop     Stops only the workers this script started.
 #   ios-workers.sh status   Lists the workers this script started and whether they are running.
 #   ios-workers.sh install  Adds a LaunchAgent so "start" runs each time you log in.
@@ -41,6 +44,11 @@
 #                             starts a fresh one.
 #   IOS_WORKERS_LOOP          "1" (default) runs each worker inside a restart loop.
 #                             "0" runs the worker once, with no restart.
+#   IOS_WORKERS_WATCH_INTERVAL Seconds between re-scans for new or removed iOS repos
+#                             while workers are running. Default 300 (5 minutes).
+#                             "0" turns off periodic watching. With the restart loop on,
+#                             single mode still re-scans before each worker restart
+#                             (idle timeout or crash), so new repos are picked up then.
 #   IOS_WORKERS_LABEL         LaunchAgent label for install and uninstall.
 #   IOS_WORKERS_RESTART_DELAY Seconds to wait before a normal restart. Default 5.
 #
@@ -102,6 +110,7 @@ LOG_DIR="$HOME/Library/Logs/ios-workers"
 DATA_ROOT="$HOME/.local/share/ios-workers"   # Only used by per-repo mode.
 IDLE_TIMEOUT="${IOS_WORKERS_IDLE_TIMEOUT:-3600}"
 USE_LOOP="${IOS_WORKERS_LOOP:-1}"
+WATCH_INTERVAL="${IOS_WORKERS_WATCH_INTERVAL:-300}"
 RESTART_DELAY="${IOS_WORKERS_RESTART_DELAY:-5}"
 FAST_FAIL_SECONDS=60      # A run shorter than this counts as a fast failure.
 MAX_BACKOFF_SECONDS=300   # Longest wait between restarts.
@@ -112,6 +121,8 @@ LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LAUNCHCTL="${IOS_WORKERS_LAUNCHCTL:-launchctl}"   # Test hook only.
 MAX_WORKERS=200
 STOP_WAIT_SECONDS=15
+SINGLE_KEY="all-repos"
+WATCH_KEY="per-repo-watch"
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -136,6 +147,10 @@ check_settings() {
   fi
   if ! is_number "$IDLE_TIMEOUT" || ! is_number "$RESTART_DELAY"; then
     warn "Error: IOS_WORKERS_IDLE_TIMEOUT and IOS_WORKERS_RESTART_DELAY must be whole numbers."
+    exit 2
+  fi
+  if ! is_number "$WATCH_INTERVAL"; then
+    warn "Error: IOS_WORKERS_WATCH_INTERVAL must be a whole number."
     exit 2
   fi
   case "$USE_LOOP" in
@@ -302,6 +317,29 @@ collect_repos() {
   fi
 }
 
+# Sorted newline-separated repo paths. Used to detect when the set of repos changes.
+repos_fingerprint() {
+  if [ "${#REPOS[@]}" -eq 0 ]; then
+    printf ''
+    return 0
+  fi
+  printf '%s\n' "${REPOS[@]}" | LC_ALL=C sort
+}
+
+# Sleep that wakes early when the supervisor is asked to stop (TERM/INT/HUP).
+# Relies on the caller's "stopping" variable and a trap that sets it.
+interruptible_sleep() {
+  local total="$1" left chunk=5
+  left="$total"
+  while [ "$left" -gt 0 ] && [ "${stopping:-0}" -eq 0 ]; do
+    chunk=5
+    [ "$left" -lt "$chunk" ] && chunk="$left"
+    sleep "$chunk" &
+    wait $! 2>/dev/null
+    left=$((left - chunk))
+  done
+}
+
 # Key used for pid and log file names: a readable slug plus a short hash of the path.
 repo_key() {
   local path="$1" base hash
@@ -326,8 +364,11 @@ is_our_worker() {
   is_number "$pid" || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
-  # Either the restart loop (this script with _run-loop) or a worker started directly.
-  case "$cmd" in *_run-loop*|*agent*worker*) return 0 ;; *) return 1 ;; esac
+  # A supervisor from this script, or a worker started directly.
+  case "$cmd" in
+    *_run-loop*|*_run-single*|*_watch-per-repo*|*agent*worker*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Finds the Cursor CLI. Looks for "agent" first, then "cursor-agent".
@@ -385,9 +426,10 @@ ensure_dirs() {
   chmod 700 "$LOG_DIR" 2>/dev/null
 }
 
-# Launch one worker in its own process group. Arguments: key, label, then --worker-dir args.
-launch_worker() {
-  local key="$1" label="$2" name="$3"; shift 3
+# Shared "already running / write pid / check start" for background supervisors and workers.
+# Arguments: key, label, then the command words to run under nohup.
+launch_background() {
+  local key="$1" label="$2"; shift 2
   local pidfile="$PID_DIR/$key.pid" log="$LOG_DIR/$key.log" pid
   if [ -f "$pidfile" ]; then
     read_pidfile "$pidfile"
@@ -403,13 +445,7 @@ launch_worker() {
   # set -m gives the background job its own process group, so stop can end
   # the worker and any child processes it starts, and nothing else.
   set -m
-  if [ "$USE_LOOP" = "1" ]; then
-    nohup /bin/bash "$SELF" _run-loop "$AGENT" --name "$name" \
-      --idle-release-timeout "$IDLE_TIMEOUT" "$@" >> "$log" 2>&1 < /dev/null &
-  else
-    nohup "$AGENT" worker --name "$name" --idle-release-timeout "$IDLE_TIMEOUT" "$@" start \
-      >> "$log" 2>&1 < /dev/null &
-  fi
+  nohup "$@" >> "$log" 2>&1 < /dev/null &
   pid=$!
   set +m
   printf '%s\n%s\n' "$pid" "$label" > "$pidfile"
@@ -424,43 +460,228 @@ launch_worker() {
   fi
 }
 
-# Internal. Runs one worker again and again until stopped.
+# Launch one per-repo worker (fixed --worker-dir). Arguments: key, label, name, then worker args.
+launch_worker() {
+  local key="$1" label="$2" name="$3"; shift 3
+  if [ "$USE_LOOP" = "1" ]; then
+    launch_background "$key" "$label" /bin/bash "$SELF" _run-loop "$AGENT" --name "$name" \
+      --idle-release-timeout "$IDLE_TIMEOUT" "$@"
+  else
+    launch_background "$key" "$label" "$AGENT" worker --name "$name" \
+      --idle-release-timeout "$IDLE_TIMEOUT" "$@" start
+  fi
+}
+
+# Launch the single-mode supervisor that re-scans for repos and keeps one worker up.
+launch_single_supervisor() {
+  local name="$1"
+  if [ "$USE_LOOP" = "1" ]; then
+    launch_background "$SINGLE_KEY" "all repos" /bin/bash "$SELF" _run-single "$AGENT" "$name"
+  else
+    local args=() i
+    for i in "${!REPOS[@]}"; do args+=(--worker-dir "${REPOS[$i]}"); done
+    launch_background "$SINGLE_KEY" "all repos" "$AGENT" worker --name "$name" \
+      --idle-release-timeout "$IDLE_TIMEOUT" "${args[@]}" start
+  fi
+}
+
+# Launch the per-repo watcher that starts workers for newly found repos.
+launch_per_repo_watch() {
+  local name="$1"
+  launch_background "$WATCH_KEY" "per-repo watch" /bin/bash "$SELF" _watch-per-repo "$AGENT" "$name"
+}
+
+# Wait until a child PID has exited. Sets rc to its exit status.
+wait_for_child() {
+  local pid="$1"
+  wait "$pid" 2>/dev/null; rc=$?
+  while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+}
+
+# Backoff after a worker exit. Sets delay. Uses and updates fast.
+compute_restart_delay() {
+  local ran="$1" i
+  if [ "$ran" -lt "$FAST_FAIL_SECONDS" ]; then
+    fast=$((fast + 1))
+    if [ "$fast" -ge "$MAX_FAST_FAILURES" ]; then
+      say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker failed $fast times in a row. Giving up. Run start again after fixing the problem."
+      exit 1
+    fi
+    delay="$RESTART_DELAY"; i=1
+    while [ "$i" -lt "$fast" ] && [ "$delay" -lt "$MAX_BACKOFF_SECONDS" ]; do
+      delay=$((delay * 2)); i=$((i + 1))
+    done
+    [ "$delay" -gt "$MAX_BACKOFF_SECONDS" ] && delay="$MAX_BACKOFF_SECONDS"
+  else
+    fast=0
+    delay="$RESTART_DELAY"
+  fi
+}
+
+# Internal. Runs one worker again and again until stopped (fixed worker args).
 # Arguments: CLI path, then the worker options. Output goes to the worker's log.
 run_loop() {
   local cli="$1"; shift
-  local child="" stopping=0 fast=0 rc started ran delay i
+  local child="" stopping=0 fast=0 rc started ran delay
   trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT HUP
   while [ "$stopping" -eq 0 ]; do
     started="$(date +%s)"
     say "$(date '+%Y-%m-%d %H:%M:%S %Z') Starting worker."
     "$cli" worker "$@" start &
     child=$!
-    wait "$child"; rc=$?
-    # A signal interrupts wait. Wait again until the worker has really exited.
-    while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
+    wait_for_child "$child"
     child=""
     [ "$stopping" -eq 1 ] && break
     ran=$(( $(date +%s) - started ))
-    if [ "$ran" -lt "$FAST_FAIL_SECONDS" ]; then
-      fast=$((fast + 1))
-      if [ "$fast" -ge "$MAX_FAST_FAILURES" ]; then
-        say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker failed $fast times in a row. Giving up. Run start again after fixing the problem."
-        exit 1
-      fi
-      delay="$RESTART_DELAY"; i=1
-      while [ "$i" -lt "$fast" ] && [ "$delay" -lt "$MAX_BACKOFF_SECONDS" ]; do
-        delay=$((delay * 2)); i=$((i + 1))
-      done
-      [ "$delay" -gt "$MAX_BACKOFF_SECONDS" ] && delay="$MAX_BACKOFF_SECONDS"
-    else
-      fast=0
-      delay="$RESTART_DELAY"
-    fi
+    compute_restart_delay "$ran"
     say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker exited with code $rc after $ran seconds. Restarting in $delay seconds."
-    sleep "$delay" &
-    wait $! 2>/dev/null
+    interruptible_sleep "$delay"
   done
   say "$(date '+%Y-%m-%d %H:%M:%S %Z') Restart loop stopped."
+}
+
+# Internal. Single-mode supervisor: re-scan for iOS repos, run one worker with every
+# --worker-dir, and restart when the repo set changes or the worker exits.
+# Arguments: CLI path, machine name.
+run_single() {
+  local cli="$1" name="$2"
+  local child="" stopping=0 fast=0 rc started ran delay
+  local current_fp="" new_fp refreshed=0
+  local args=() i
+  trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT HUP
+  while [ "$stopping" -eq 0 ]; do
+    collect_repos quiet
+    new_fp="$(repos_fingerprint)"
+    if [ "${#REPOS[@]}" -eq 0 ]; then
+      if [ "$WATCH_INTERVAL" -eq 0 ]; then
+        say "$(date '+%Y-%m-%d %H:%M:%S %Z') No iOS repos found and watch is off. Exiting."
+        exit 0
+      fi
+      say "$(date '+%Y-%m-%d %H:%M:%S %Z') No iOS repos found. Checking again in $WATCH_INTERVAL seconds."
+      interruptible_sleep "$WATCH_INTERVAL"
+      continue
+    fi
+    if [ "${#REPOS[@]}" -gt "$MAX_WORKERS" ]; then
+      say "$(date '+%Y-%m-%d %H:%M:%S %Z') Found ${#REPOS[@]} repos, over the limit of $MAX_WORKERS. Waiting $WATCH_INTERVAL seconds."
+      if [ "$WATCH_INTERVAL" -eq 0 ]; then
+        exit 6
+      fi
+      interruptible_sleep "$WATCH_INTERVAL"
+      continue
+    fi
+    args=(--name "$name" --idle-release-timeout "$IDLE_TIMEOUT")
+    for i in "${!REPOS[@]}"; do
+      args+=(--worker-dir "${REPOS[$i]}")
+    done
+    current_fp="$new_fp"
+    started="$(date +%s)"
+    refreshed=0
+    say "$(date '+%Y-%m-%d %H:%M:%S %Z') Starting worker for ${#REPOS[@]} repo(s)."
+    for i in "${!REPOS[@]}"; do
+      say "  ${SLUGS[$i]} at ${REPOS[$i]}"
+    done
+    "$cli" worker "${args[@]}" start &
+    child=$!
+    if [ "$WATCH_INTERVAL" -gt 0 ]; then
+      while kill -0 "$child" 2>/dev/null && [ "$stopping" -eq 0 ]; do
+        interruptible_sleep "$WATCH_INTERVAL"
+        [ "$stopping" -eq 1 ] && break
+        kill -0 "$child" 2>/dev/null || break
+        collect_repos quiet
+        new_fp="$(repos_fingerprint)"
+        if [ "$new_fp" != "$current_fp" ]; then
+          say "$(date '+%Y-%m-%d %H:%M:%S %Z') Repo set changed. Restarting worker with updated directories."
+          kill -TERM "$child" 2>/dev/null
+          refreshed=1
+          break
+        fi
+      done
+      wait_for_child "$child"
+    else
+      wait_for_child "$child"
+    fi
+    child=""
+    [ "$stopping" -eq 1 ] && break
+    if [ "$refreshed" -eq 1 ]; then
+      fast=0
+      continue
+    fi
+    ran=$(( $(date +%s) - started ))
+    compute_restart_delay "$ran"
+    say "$(date '+%Y-%m-%d %H:%M:%S %Z') Worker exited with code $rc after $ran seconds. Restarting in $delay seconds."
+    interruptible_sleep "$delay"
+  done
+  say "$(date '+%Y-%m-%d %H:%M:%S %Z') Single-mode supervisor stopped."
+}
+
+# Stop one tracked worker by pid file path. Used by the per-repo watcher.
+stop_pidfile() {
+  local f="$1" pgid waited
+  [ -f "$f" ] || return 0
+  read_pidfile "$f"
+  if ! is_our_worker "$PF_PID"; then
+    rm -f "$f"
+    return 0
+  fi
+  pgid="$(ps -p "$PF_PID" -o pgid= 2>/dev/null | tr -d ' ')"
+  if [ "$pgid" = "$PF_PID" ]; then
+    kill -TERM -- "-$PF_PID" 2>/dev/null
+  else
+    kill -TERM "$PF_PID" 2>/dev/null
+  fi
+  waited=0
+  while is_our_worker "$PF_PID" && [ "$waited" -lt "$STOP_WAIT_SECONDS" ]; do
+    sleep 1; waited=$((waited + 1))
+  done
+  if is_our_worker "$PF_PID"; then
+    if [ "$pgid" = "$PF_PID" ]; then kill -KILL -- "-$PF_PID" 2>/dev/null; else kill -KILL "$PF_PID" 2>/dev/null; fi
+  fi
+  say "$(date '+%Y-%m-%d %H:%M:%S %Z') Stopped: $PF_REPO (process $PF_PID)."
+  rm -f "$f"
+}
+
+# Internal. Per-repo watcher: periodically re-scan and start/stop workers to match.
+# Arguments: CLI path, machine name.
+run_watch_per_repo() {
+  local cli="$1" name="$2"
+  local stopping=0 key f still i
+  trap 'stopping=1' TERM INT HUP
+  AGENT="$cli"
+  while [ "$stopping" -eq 0 ]; do
+    collect_repos quiet
+    if [ "${#REPOS[@]}" -gt "$MAX_WORKERS" ]; then
+      say "$(date '+%Y-%m-%d %H:%M:%S %Z') Found ${#REPOS[@]} repos, over the limit of $MAX_WORKERS. Not starting more."
+    else
+      for i in "${!REPOS[@]}"; do
+        [ "$stopping" -eq 1 ] && break
+        key="$(repo_key "${REPOS[$i]}")"
+        mkdir -p "$DATA_ROOT/$key" && chmod 700 "$DATA_ROOT" "$DATA_ROOT/$key" 2>/dev/null
+        launch_worker "$key" "${REPOS[$i]}" "$name" \
+          --data-dir "$DATA_ROOT/$key" --worker-dir "${REPOS[$i]}" || true
+      done
+    fi
+    for f in "$PID_DIR"/*.pid; do
+      [ -f "$f" ] || continue
+      case "$(basename "$f")" in
+        "$WATCH_KEY.pid"|"$SINGLE_KEY.pid") continue ;;
+      esac
+      read_pidfile "$f"
+      still=0
+      for i in "${!REPOS[@]}"; do
+        if [ "$PF_REPO" = "${REPOS[$i]}" ]; then still=1; break; fi
+      done
+      if [ "$still" -eq 0 ]; then
+        say "$(date '+%Y-%m-%d %H:%M:%S %Z') Repo no longer matched: $PF_REPO. Stopping its worker."
+        stop_pidfile "$f"
+      fi
+    done
+    if [ "$WATCH_INTERVAL" -eq 0 ]; then
+      say "$(date '+%Y-%m-%d %H:%M:%S %Z') Per-repo watch pass done and watch is off. Exiting."
+      exit 0
+    fi
+    interruptible_sleep "$WATCH_INTERVAL"
+  done
+  say "$(date '+%Y-%m-%d %H:%M:%S %Z') Per-repo watch stopped."
 }
 
 xml_escape() {
@@ -482,9 +703,10 @@ check_launchctl() {
   fi
 }
 
-# Writes the LaunchAgent. It runs "start" once at login. The workers then run on their
-# own, in their own process groups, so AbandonProcessGroup keeps launchd from ending them
-# when "start" finishes. Current settings are saved into the plist.
+# Writes the LaunchAgent. It runs "start" once at login. The supervisors then run on
+# their own, in their own process groups, so AbandonProcessGroup keeps launchd from
+# ending them when "start" finishes. Those supervisors keep watching for new repos.
+# Current settings are saved into the plist.
 write_plist() {
   local file="$1" var val
   {
@@ -507,7 +729,7 @@ write_plist() {
     printf '    <key>IOS_WORKERS_CLI</key>\n    <string>%s</string>\n' "$(xml_escape "$AGENT")"
     for var in IOS_WORKERS_NAME IOS_WORKERS_MODE IOS_WORKERS_MAX_DEPTH IOS_WORKERS_DETECT_DEPTH \
                SEARCH_ROOT IOS_WORKERS_ROOT IOS_WORKERS_IDLE_TIMEOUT IOS_WORKERS_LOOP \
-               IOS_WORKERS_RESTART_DELAY IOS_WORKERS_LABEL; do
+               IOS_WORKERS_WATCH_INTERVAL IOS_WORKERS_RESTART_DELAY IOS_WORKERS_LABEL; do
       val="${!var:-}"
       [ -n "$val" ] && printf '    <key>%s</key>\n    <string>%s</string>\n' "$var" "$(xml_escape "$val")"
     done
@@ -577,9 +799,11 @@ cmd_start() {
   check_settings; check_git
   check_agent_ready
   collect_repos
-  local name i failed=0 args
+  local name i failed=0
   name="$(machine_name)"
-  if [ "${#REPOS[@]}" -eq 0 ]; then
+  # With the restart loop and watch on, start a supervisor even when no repos are
+  # found yet, so newly cloned iOS repos are picked up without a manual restart.
+  if [ "${#REPOS[@]}" -eq 0 ] && { [ "$USE_LOOP" != "1" ] || [ "$WATCH_INTERVAL" -eq 0 ]; }; then
     say "No iOS repos to serve. Nothing was started."
     return 0
   fi
@@ -595,31 +819,46 @@ cmd_start() {
     [ -f "$f" ] || continue
     read_pidfile "$f"
     is_our_worker "$PF_PID" || continue
-    if [ "$MODE" = "single" ] && [ "$(basename "$f")" != "all-repos.pid" ]; then other=1; fi
-    if [ "$MODE" = "per-repo" ] && [ "$(basename "$f")" = "all-repos.pid" ]; then other=1; fi
+    if [ "$MODE" = "single" ] && [ "$(basename "$f")" != "$SINGLE_KEY.pid" ]; then other=1; fi
+    if [ "$MODE" = "per-repo" ] && [ "$(basename "$f")" = "$SINGLE_KEY.pid" ]; then other=1; fi
   done
   if [ "$other" -eq 1 ]; then
     warn "Error: workers from the other mode are running. Run \"$PROG stop\" first, then start again."
     exit 7
   fi
   say "Machine name: $name"
+  if [ "$USE_LOOP" = "1" ] && [ "$WATCH_INTERVAL" -gt 0 ]; then
+    say "Watching for new iOS repos every $WATCH_INTERVAL seconds."
+  fi
   if [ "$MODE" = "single" ]; then
-    args=()
-    for i in "${!REPOS[@]}"; do args+=(--worker-dir "${REPOS[$i]}"); done
     # The first --worker-dir sets the worker's repo= label. The other repos are still served.
-    launch_worker "all-repos" "all repos" "$name" "${args[@]}" || failed=1
+    # With the loop on, _run-single re-scans and rebuilds the --worker-dir list.
+    if [ "$USE_LOOP" != "1" ] && [ "${#REPOS[@]}" -eq 0 ]; then
+      say "No iOS repos to serve. Nothing was started."
+      return 0
+    fi
+    launch_single_supervisor "$name" || failed=1
   else
     say "Per-repo mode is experimental. Each worker gets its own data folder under $DATA_ROOT."
-    local key
-    for i in "${!REPOS[@]}"; do
-      key="$(repo_key "${REPOS[$i]}")"
-      mkdir -p "$DATA_ROOT/$key" && chmod 700 "$DATA_ROOT" "$DATA_ROOT/$key" 2>/dev/null
-      launch_worker "$key" "${REPOS[$i]}" "$name" \
-        --data-dir "$DATA_ROOT/$key" --worker-dir "${REPOS[$i]}" || failed=$((failed + 1))
-    done
+    if [ "$USE_LOOP" = "1" ] && [ "$WATCH_INTERVAL" -gt 0 ]; then
+      # One watcher starts and stops per-repo workers as the set of repos changes.
+      launch_per_repo_watch "$name" || failed=1
+    else
+      local key
+      for i in "${!REPOS[@]}"; do
+        key="$(repo_key "${REPOS[$i]}")"
+        mkdir -p "$DATA_ROOT/$key" && chmod 700 "$DATA_ROOT" "$DATA_ROOT/$key" 2>/dev/null
+        launch_worker "$key" "${REPOS[$i]}" "$name" \
+          --data-dir "$DATA_ROOT/$key" --worker-dir "${REPOS[$i]}" || failed=$((failed + 1))
+      done
+    fi
   fi
   say ""
-  say "To run a cloud agent here, target machine=$name for one of the repos above."
+  if [ "${#REPOS[@]}" -gt 0 ]; then
+    say "To run a cloud agent here, target machine=$name for one of the repos above."
+  else
+    say "No iOS repos yet. The watcher will start a worker when it finds one."
+  fi
   [ "$failed" -eq 0 ]
 }
 
@@ -686,6 +925,8 @@ main() {
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
     _run-loop) shift; run_loop "$@" ;;
+    _run-single) shift; run_single "$@" ;;
+    _watch-per-repo) shift; run_watch_per_repo "$@" ;;
     help|-h|--help) usage ;;
     *) warn "Unknown command: $1"; usage; exit 2 ;;
   esac
